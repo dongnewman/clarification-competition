@@ -12,6 +12,7 @@ Main Contact: dongnewman2@gmail.com
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import math
 import re
@@ -640,7 +641,7 @@ def _run_from_plan(
     return _FAILURE, state
 
 
-class DecisionClarifier(ClarificationAlgorithmBase):
+class _R0DecisionClarifier(ClarificationAlgorithmBase):
     """Fixed candidate planner with a conservative, configurable question gate."""
 
     DEFAULT_CONFIG = {
@@ -692,3 +693,1165 @@ class DecisionClarifier(ClarificationAlgorithmBase):
             env, problem, config, plan, branch="policy", plan_cost=plan_cost, state=state
         )
         return output
+
+
+# Inline, conservative Plan quote normalization and completion cleanup keep this
+# submission self-contained while retaining the pinned V1 behavior.
+
+
+def _normalize_layout(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _has_quote_marker(text: str) -> bool:
+    for i, char in enumerate(text):
+        if char not in _QUOTE_CHARS:
+            continue
+        if char in {"'", "’"} and i > 0 and i + 1 < len(text):
+            if text[i - 1].isalnum() and text[i + 1].isalnum():
+                continue
+        return True
+    return False
+
+
+def _escaped_at(text: str, index: int) -> bool:
+    slash_count = 0
+    k = index - 1
+    while k >= 0 and text[k] == "\\":
+        slash_count += 1
+        k -= 1
+    return slash_count % 2 == 1
+
+
+def _docstring_delimiters(text: str) -> list[tuple[int, int, int, int]]:
+    """Find triple-quoted module/class/function docstrings confirmed by AST.
+
+    Each tuple contains opening-start, opening-end, closing-start, and
+    closing-end offsets. Only the outer delimiters are exempted from literal
+    protection; the docstring contents remain scanned for inner literals.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, TypeError):
+        return []
+
+    line_starts = [0]
+    line_starts.extend(match.end() for match in re.finditer("\n", text))
+
+    def offset(line_number: int, utf8_column: int) -> int:
+        if line_number < 1 or line_number > len(line_starts):
+            raise ValueError("AST line is outside source")
+        line_start = line_starts[line_number - 1]
+        line_end = text.find("\n", line_start)
+        if line_end < 0:
+            line_end = len(text)
+        prefix = text[line_start:line_end].encode("utf-8")[:utf8_column].decode("utf-8")
+        return line_start + len(prefix)
+
+    found: list[tuple[int, int, int, int]] = []
+    scope_types = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(tree):
+        if not isinstance(node, scope_types) or not node.body:
+            continue
+        first = node.body[0]
+        if (
+            not isinstance(first, ast.Expr)
+            or not isinstance(first.value, ast.Constant)
+            or not isinstance(first.value.value, str)
+        ):
+            continue
+        value = first.value
+        if (
+            not hasattr(value, "end_lineno")
+            or value.end_lineno is None
+            or value.end_col_offset is None
+        ):
+            continue
+        try:
+            start = offset(value.lineno, value.col_offset)
+            end = offset(value.end_lineno, value.end_col_offset)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        literal = text[start:end]
+        opening = re.match(r"(?i:[ru]{0,2})(\"\"\"|''')", literal)
+        if opening is None:
+            continue
+        delimiter = opening.group(1)
+        open_start = start + opening.start(1)
+        open_end = start + opening.end(1)
+        if not literal.endswith(delimiter) or len(literal) < opening.end(1) + len(delimiter):
+            continue
+        close_start = end - len(delimiter)
+        if _escaped_at(text, close_start):
+            continue
+        found.append((open_start, open_end, close_start, end))
+    return found
+
+
+def _quoted_regions(text: str) -> list[tuple[int, int]]:
+    """Locate quoted/code literals while allowing AST-confirmed docstring prose."""
+    regions: list[tuple[int, int]] = []
+    docstrings = _docstring_delimiters(text)
+    docstring_open = {start: end for start, end, _, _ in docstrings}
+    docstring_close = {start: end for _, _, start, end in docstrings}
+    i = 0
+    start: int | None = None
+    closing: str | None = None
+    while i < len(text):
+        if closing is None and i in docstring_open:
+            i = docstring_open[i]
+            continue
+        if closing is None and i in docstring_close:
+            i = docstring_close[i]
+            continue
+        char = text[i]
+        if closing is None:
+            # Ignore a plain apostrophe embedded inside a word (for example,
+            # "dog's"); unmatched or ambiguous punctuation stays conservative.
+            if char in {"'", "’"} and i > 0 and i + 1 < len(text):
+                if text[i - 1].isalnum() and text[i + 1].isalnum():
+                    i += 1
+                    continue
+            if char in _OPEN_TO_CLOSE:
+                start = i
+                if char == "`":
+                    run = 1
+                    while i + run < len(text) and text[i + run] == "`":
+                        run += 1
+                    closing = "`" * run
+                    i += run
+                    continue
+                run = 3 if text.startswith(char * 3, i) else 1
+                closing = _OPEN_TO_CLOSE[char] * run
+                i += run
+                continue
+        else:
+            if closing.startswith("`"):
+                if text.startswith(closing, i):
+                    regions.append((start if start is not None else i, i + len(closing)))
+                    i += len(closing)
+                    start = None
+                    closing = None
+                    continue
+            elif text.startswith(closing, i) and not _escaped_at(text, i):
+                regions.append((start if start is not None else i, i + len(closing)))
+                i += len(closing)
+                start = None
+                closing = None
+                continue
+        i += 1
+    if closing is not None and start is not None:
+        regions.append((start, len(text)))
+    return regions
+
+
+def _overlaps_region(start: int, end: int, regions: list[tuple[int, int]]) -> bool:
+    return any(start < region_end and region_start < end for region_start, region_end in regions)
+
+
+def _whitespace_pattern(quote: str) -> str:
+    parts = re.split(r"(\s+)", quote)
+    return "".join(r"\s+" if part and part.isspace() else re.escape(part) for part in parts)
+
+
+def ground_quote(prompt: str, quote: Any) -> tuple[str | None, dict[str, Any]]:
+    """Return an exact prompt slice if quote is valid, plus a grounding receipt.
+
+    Exact substring behavior matches the original R0 validator's `quote.strip()
+    in prompt` check. Fallback normalization only collapses whitespace layout
+    and requires a unique literal-preserving source span. The receipt records
+    a half-open character interval into the original prompt.
+    """
+    receipt: dict[str, Any] = {
+        "original_quote": quote,
+        "status": "rejected_invalid_quote",
+        "source_span": None,
+        "source_text": None,
+    }
+    if not isinstance(prompt, str) or not isinstance(quote, str):
+        return None, receipt
+    stripped = quote.strip()
+    if not stripped:
+        receipt["status"] = "rejected_empty_quote"
+        return None, receipt
+
+    exact_start = prompt.find(stripped)
+    if exact_start >= 0:
+        exact_end = exact_start + len(stripped)
+        receipt.update(
+            {
+                "status": "exact_match",
+                "source_span": [exact_start, exact_end],
+                "source_text": prompt[exact_start:exact_end],
+            }
+        )
+        return stripped, receipt
+
+    if _has_quote_marker(stripped):
+        receipt["status"] = "rejected_quoted_normalization"
+        return None, receipt
+    normalized = _normalize_layout(stripped)
+    if not normalized:
+        receipt["status"] = "rejected_empty_normalized_quote"
+        return None, receipt
+
+    pattern = re.compile(r"(?=(" + _whitespace_pattern(stripped) + r"))")
+    matches = [(match.start(1), match.end(1)) for match in pattern.finditer(prompt)]
+    if len(matches) != 1:
+        receipt["status"] = "rejected_ambiguous_or_missing_span"
+        return None, receipt
+    start, end = matches[0]
+    source_text = prompt[start:end]
+    if _has_quote_marker(source_text):
+        receipt["status"] = "rejected_quoted_normalization"
+        return None, receipt
+    if _normalize_layout(source_text) != normalized:
+        receipt["status"] = "rejected_non_whitespace_difference"
+        return None, receipt
+    if _overlaps_region(start, end, _quoted_regions(prompt)):
+        receipt["status"] = "rejected_literal_context"
+        return None, receipt
+
+    receipt.update(
+        {
+            "status": "normalized_whitespace",
+            "source_span": [start, end],
+            "source_text": source_text,
+        }
+    )
+    return source_text, receipt
+
+
+_QUOTE_CHARS = {'"', "'", "`", "“", "”", "‘", "’"}
+_OPEN_TO_CLOSE = {'"': '"', "'": "'", "`": "`", "“": "”", "‘": "’"}
+
+
+_FORBIDDEN_NAMES = {
+    "eval",
+    "exec",
+    "globals",
+    "locals",
+    "vars",
+    "getattr",
+    "setattr",
+    "delattr",
+    "__import__",
+    "__builtins__",
+}
+_PURE_BUILTINS = {
+    "abs",
+    "all",
+    "any",
+    "bin",
+    "bool",
+    "chr",
+    "divmod",
+    "enumerate",
+    "float",
+    "hex",
+    "int",
+    "isinstance",
+    "issubclass",
+    "len",
+    "list",
+    "max",
+    "min",
+    "oct",
+    "ord",
+    "pow",
+    "range",
+    "round",
+    "slice",
+    "sorted",
+    "str",
+    "sum",
+    "tuple",
+}
+_PURE_STRING_METHODS = {
+    "casefold",
+    "endswith",
+    "isalpha",
+    "isdigit",
+    "islower",
+    "isnumeric",
+    "isupper",
+    "lower",
+    "lstrip",
+    "rstrip",
+    "startswith",
+    "strip",
+    "upper",
+}
+_SAFE_EXPRESSION_NODES = (
+    ast.Constant,
+    ast.Name,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.UnaryOp,
+    ast.BinOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.IfExp,
+    ast.JoinedStr,
+    ast.FormattedValue,
+)
+
+
+class _Names(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.stores: set[str] = set()
+        self.loads: set[str] = set()
+        self.global_or_nonlocal = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.stores.add(node.id)
+        elif isinstance(node.ctx, ast.Load):
+            self.loads.add(node.id)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.global_or_nonlocal = True
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.global_or_nonlocal = True
+
+
+class _FunctionLocalNames(ast.NodeVisitor):
+    def __init__(self, function: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.names = {
+            arg.arg
+            for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs)
+        }
+        if function.args.vararg is not None:
+            self.names.add(function.args.vararg.arg)
+        if function.args.kwarg is not None:
+            self.names.add(function.args.kwarg.arg)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        return
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        return
+
+
+class _NoDefinitionsOrImports(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.found = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.found = True
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+    visit_Import = visit_FunctionDef
+    visit_ImportFrom = visit_FunctionDef
+
+
+def _literal_value(node: ast.AST) -> bool:
+    """Accept inert constants/containers and simple operators, never calls or access."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        return False
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_literal_value(item) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is None or _literal_value(key) for key in node.keys) and all(
+            _literal_value(value) for value in node.values
+        )
+    if isinstance(node, ast.UnaryOp):
+        return _literal_value(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _literal_value(node.left) and _literal_value(node.right)
+    if isinstance(node, ast.BoolOp):
+        return all(_literal_value(value) for value in node.values)
+    if isinstance(node, ast.Compare):
+        return _literal_value(node.left) and all(
+            _literal_value(value) for value in node.comparators
+        )
+    if isinstance(node, ast.IfExp):
+        return all(_literal_value(value) for value in (node.test, node.body, node.orelse))
+    return False
+
+
+def _safe_annotation(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id in {
+        "bool",
+        "bytes",
+        "float",
+        "int",
+        "str",
+        "tuple",
+        "list",
+        "dict",
+        "set",
+    }
+
+
+def _safe_test_expression(node: ast.AST, safe_builtins: set[str], safe_functions: set[str]) -> bool:
+    """Permit pure expressions and direct calls to known module functions/builtins."""
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name):
+            if node.func.id in _FORBIDDEN_NAMES:
+                return False
+            if node.func.id not in safe_builtins and node.func.id not in safe_functions:
+                return False
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in _PURE_STRING_METHODS
+            and isinstance(node.func.value, ast.Name)
+        ):
+            if not _safe_test_expression(node.func.value, safe_builtins, safe_functions):
+                return False
+        else:
+            return False
+        return all(
+            _safe_test_expression(arg, safe_builtins, safe_functions) for arg in node.args
+        ) and all(
+            _safe_test_expression(kw.value, safe_builtins, safe_functions) for kw in node.keywords
+        )
+    if isinstance(node, _SAFE_EXPRESSION_NODES):
+        return all(
+            _safe_test_expression(child, safe_builtins, safe_functions)
+            for child in ast.iter_child_nodes(node)
+        )
+    if isinstance(
+        node, (ast.expr_context, ast.operator, ast.unaryop, ast.boolop, ast.cmpop, ast.keyword)
+    ):
+        return all(
+            _safe_test_expression(child, safe_builtins, safe_functions)
+            for child in ast.iter_child_nodes(node)
+        )
+    # Reject Attribute, Subscript, comprehensions, lambdas, named expressions,
+    # await/yield and any syntax not explicitly treated as inert above.
+    return False
+
+
+def _safe_function_closure(
+    tree: ast.Module, safe_builtins: set[str], rebound_functions: set[str]
+) -> set[str]:
+    """Keep direct test calls only when their module-function call closure is simple.
+
+    This is deliberately a small syntactic check, not a proof of arbitrary
+    Python purity. Unknown, attribute, import, dynamic, and mutable-global
+    behavior rejects cleanup.
+    """
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    safe: set[str] = set()
+    visiting: set[str] = set()
+
+    def check(name: str) -> bool:
+        if name in safe or name in visiting:
+            return True
+        if name in rebound_functions:
+            return False
+        node = functions.get(name)
+        if node is None:
+            return False
+        if node.decorator_list:
+            return False
+        visiting.add(name)
+        parameter_names = {
+            arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+        }
+        if node.args.vararg is not None:
+            parameter_names.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            parameter_names.add(node.args.kwarg.arg)
+        local_names = _FunctionLocalNames(node)
+        local_names.visit(node)
+        parents = {
+            child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)
+        }
+        function_names = set(functions)
+        free_names = _Names()
+        free_names.visit(node)
+        if free_names.loads - local_names.names - safe_builtins - function_names:
+            visiting.remove(name)
+            return False
+        for part in ast.walk(node):
+            if isinstance(part, (ast.With, ast.AsyncWith, ast.Await, ast.Yield, ast.YieldFrom)):
+                visiting.remove(name)
+                return False
+            if isinstance(part, (ast.Global, ast.Nonlocal, ast.Import, ast.ImportFrom)):
+                visiting.remove(name)
+                return False
+            if isinstance(part, ast.Name) and part.id in _FORBIDDEN_NAMES:
+                visiting.remove(name)
+                return False
+            if isinstance(part, ast.Call):
+                if isinstance(part.func, ast.Name):
+                    target = part.func.id
+                    if target in _FORBIDDEN_NAMES or target == "print":
+                        visiting.remove(name)
+                        return False
+                    if target in local_names.names:
+                        visiting.remove(name)
+                        return False
+                    if target not in safe_builtins and not check(target):
+                        visiting.remove(name)
+                        return False
+                elif (
+                    isinstance(part.func, ast.Attribute)
+                    and part.func.attr in _PURE_STRING_METHODS
+                    and isinstance(part.func.value, ast.Name)
+                ):
+                    pass
+                else:
+                    visiting.remove(name)
+                    return False
+            if isinstance(part, ast.Attribute):
+                parent = parents.get(part)
+                if not (
+                    isinstance(parent, ast.Call)
+                    and parent.func is part
+                    and part.attr in _PURE_STRING_METHODS
+                    and isinstance(part.value, ast.Name)
+                ):
+                    visiting.remove(name)
+                    return False
+            if isinstance(
+                part, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete, ast.NamedExpr)
+            ):
+                targets = []
+                if isinstance(part, ast.Assign):
+                    targets = part.targets
+                elif isinstance(part, ast.AnnAssign):
+                    targets = [part.target]
+                elif isinstance(part, ast.AugAssign):
+                    targets = [part.target]
+                    if isinstance(part.target, ast.Name) and part.target.id in parameter_names:
+                        visiting.remove(name)
+                        return False
+                elif isinstance(part, ast.Delete):
+                    targets = part.targets
+                else:
+                    targets = [part.target]
+                if any(
+                    isinstance(child, (ast.Attribute, ast.Subscript))
+                    and isinstance(child.ctx, (ast.Store, ast.Del))
+                    for target in targets
+                    for child in ast.walk(target)
+                ):
+                    visiting.remove(name)
+                    return False
+        visiting.remove(name)
+        safe.add(name)
+        return True
+
+    for function_name in functions:
+        check(function_name)
+    return safe
+
+
+def _module_bindings_except(tree: ast.Module, excluded: ast.AST) -> set[str]:
+    """Names bound at module scope outside a node, skipping function-local stores."""
+
+    class Bindings(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.names: set[str] = set()
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.names.add(node.id)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.names.add(node.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.names.add(node.name)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                self.names.add(alias.asname or alias.name.split(".")[0])
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                if alias.name == "*":
+                    self.names.update(_PURE_BUILTINS)
+                else:
+                    self.names.add(alias.asname or alias.name)
+
+    bindings = Bindings()
+    for statement in tree.body:
+        if statement is not excluded:
+            bindings.visit(statement)
+    return bindings.names
+
+
+def _rebound_module_functions(tree: ast.Module, excluded: ast.AST) -> set[str]:
+    """Find module functions that could be overwritten outside their definition."""
+    direct_functions = [
+        node.name
+        for node in tree.body
+        if node is not excluded and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    function_names = set(direct_functions)
+
+    class OtherBindings(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.names: set[str] = set()
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.names.add(node.id)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.names.add(node.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.names.add(node.name)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                self.names.add(alias.asname or alias.name.split(".")[0])
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                if alias.name == "*":
+                    self.names.update(function_names)
+                else:
+                    self.names.add(alias.asname or alias.name)
+
+    other = OtherBindings()
+    for statement in tree.body:
+        if statement is excluded or isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        other.visit(statement)
+    duplicates = {name for name in direct_functions if direct_functions.count(name) > 1}
+    return (other.names & function_names) | duplicates
+
+
+def _is_main_test(node: ast.AST, allow_else: bool = False) -> bool:
+    if not isinstance(node, ast.If) or (node.orelse and not allow_else):
+        return False
+    test = node.test
+    if (
+        not isinstance(test, ast.Compare)
+        or len(test.ops) != 1
+        or not isinstance(test.ops[0], ast.Eq)
+    ):
+        return False
+    if len(test.comparators) != 1:
+        return False
+    left, right = test.left, test.comparators[0]
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    ) or (
+        isinstance(right, ast.Name)
+        and right.id == "__name__"
+        and isinstance(left, ast.Constant)
+        and left.value == "__main__"
+    )
+
+
+def _has_nested_main_guard(guard: ast.If) -> bool:
+    return any(
+        node is not guard and _is_main_test(node, allow_else=True) for node in ast.walk(guard)
+    )
+
+
+def _literal_data_names(statements: list[ast.stmt]) -> tuple[set[str], set[str]]:
+    names: set[str] = set()
+    dict_names: set[str] = set()
+    for node in ast.walk(ast.Module(body=statements, type_ignores=[])):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+            if not _safe_annotation(node.annotation):
+                return set(), set()
+        if value is not None and _literal_value(value):
+            bound = set()
+            for target in targets:
+                collector = _Names()
+                collector.visit(target)
+                bound.update(collector.stores)
+            names.update(bound)
+            if isinstance(value, ast.Dict):
+                dict_names.update(bound)
+    return names, dict_names
+
+
+def _safe_iter(
+    node: ast.AST,
+    data_names: set[str],
+    dict_names: set[str],
+    module_bindings: set[str],
+    guard_names: set[str],
+) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in data_names
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name):
+            return (
+                node.func.id == "range"
+                and "range" not in guard_names
+                and "range" not in module_bindings
+                and not node.keywords
+                and all(
+                    _literal_value(arg) or (isinstance(arg, ast.Name) and arg.id in data_names)
+                    for arg in node.args
+                )
+            )
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "items":
+            return (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id in dict_names
+                and not node.args
+                and not node.keywords
+            )
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_literal_value(element) for element in node.elts)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return True
+    return False
+
+
+def _simple_target(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_simple_target(item) for item in node.elts)
+    return False
+
+
+def _module_shape_is_safe(tree: ast.Module, guard: ast.If) -> bool:
+    """Allow only inert module setup around the candidate guard."""
+    for index, statement in enumerate(tree.body):
+        if statement is guard:
+            continue
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(statement, ast.Import):
+            continue
+        if isinstance(statement, ast.ImportFrom):
+            if any(alias.name == "*" for alias in statement.names):
+                return False
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            # Only the first module expression can be the module docstring.
+            if index == 0 and isinstance(statement.value.value, str):
+                continue
+            return False
+        if isinstance(statement, ast.Assign):
+            if all(_simple_target(target) for target in statement.targets) and _literal_value(
+                statement.value
+            ):
+                continue
+            return False
+        if isinstance(statement, ast.AnnAssign):
+            if (
+                _simple_target(statement.target)
+                and _safe_annotation(statement.annotation)
+                and (statement.value is None or _literal_value(statement.value))
+            ):
+                continue
+            return False
+        # Calls, attribute/subscript writes, class definitions, and all module
+        # control flow are uncertain initialization and therefore a no-op.
+        return False
+    return True
+
+
+def _has_dynamic_access(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_NAMES:
+            return True
+    return False
+
+
+def _test_statement(
+    node: ast.stmt,
+    safe_builtins: set[str],
+    safe_functions: set[str],
+    data_names: set[str],
+    dict_names: set[str],
+    module_bindings: set[str],
+    guard_names: set[str],
+) -> bool:
+    if isinstance(node, ast.Assert):
+        return _safe_test_expression(node.test, safe_builtins, safe_functions) and (
+            node.msg is None or _safe_test_expression(node.msg, safe_builtins, safe_functions)
+        )
+    if isinstance(node, ast.Pass):
+        return True
+    if isinstance(node, ast.Assign):
+        return (
+            bool(node.targets)
+            and all(_simple_target(target) for target in node.targets)
+            and _safe_test_expression(node.value, safe_builtins, safe_functions)
+        )
+    if isinstance(node, ast.AnnAssign):
+        return (
+            _simple_target(node.target)
+            and _safe_annotation(node.annotation)
+            and (
+                node.value is None
+                or _safe_test_expression(node.value, safe_builtins, safe_functions)
+            )
+        )
+    if isinstance(node, ast.For):
+        return (
+            _simple_target(node.target)
+            and _safe_iter(node.iter, data_names, dict_names, module_bindings, guard_names)
+            and all(
+                _test_statement(
+                    child,
+                    safe_builtins,
+                    safe_functions,
+                    data_names,
+                    dict_names,
+                    module_bindings,
+                    guard_names,
+                )
+                for child in node.body
+            )
+            and all(
+                _test_statement(
+                    child,
+                    safe_builtins,
+                    safe_functions,
+                    data_names,
+                    dict_names,
+                    module_bindings,
+                    guard_names,
+                )
+                for child in node.orelse
+            )
+        )
+    if isinstance(node, ast.If):
+        return (
+            not _is_main_test(node, allow_else=True)
+            and _safe_test_expression(node.test, safe_builtins, safe_functions)
+            and all(
+                _test_statement(
+                    child,
+                    safe_builtins,
+                    safe_functions,
+                    data_names,
+                    dict_names,
+                    module_bindings,
+                    guard_names,
+                )
+                for child in node.body
+            )
+            and all(
+                _test_statement(
+                    child,
+                    safe_builtins,
+                    safe_functions,
+                    data_names,
+                    dict_names,
+                    module_bindings,
+                    guard_names,
+                )
+                for child in node.orelse
+            )
+        )
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        call = node.value
+        return (
+            isinstance(call.func, ast.Name)
+            and call.func.id == "print"
+            and "print" not in guard_names
+            and "print" not in module_bindings
+            and all(_safe_test_expression(arg, safe_builtins, safe_functions) for arg in call.args)
+            and all(
+                _safe_test_expression(keyword.value, safe_builtins, safe_functions)
+                for keyword in call.keywords
+            )
+        )
+    return False
+
+
+def _candidate(tree: ast.Module) -> ast.If | None:
+    guards = [node for node in tree.body if _is_main_test(node)]
+    if len(guards) != 1 or not tree.body or tree.body[-1] is not guards[0]:
+        return None
+    return guards[0]
+
+
+def _unchanged(raw: str, status: str, reason: str) -> dict:
+    return {
+        "completion": raw,
+        "changed": False,
+        "status": status,
+        "reason": reason,
+        "removed_spans": [],
+    }
+
+
+def _split_completion(raw: str) -> tuple[str, str, str] | None:
+    """Return (prefix, Python body, suffix), preserving a complete Python fence."""
+    if not raw.startswith("```"):
+        return "", raw, ""
+    first_line_end = raw.find("\n")
+    if first_line_end < 0 or raw[:first_line_end].strip().lower() not in (
+        "```python",
+        "```python3",
+    ):
+        return None
+    closing = raw.rfind("```")
+    if closing <= first_line_end or raw[closing + 3 :].strip():
+        return None
+    return raw[: first_line_end + 1], raw[first_line_end + 1 : closing], raw[closing:]
+
+
+def clean_completion(raw_completion: str) -> dict:
+    """Remove a narrowly qualified terminal self-test block from one Python completion.
+
+    Accepts no task ID, prompt, score, or environment. The returned dictionary
+    always contains ``completion``, ``changed``, ``status``, ``reason``, and
+    ``removed_spans``. Complete Python fences are retained exactly. This is a
+    conservative syntactic contract, not a proof of semantic equivalence for
+    arbitrary Python objects or custom magic methods. Any uncertain shape or
+    failed structural check returns the original completion.
+    """
+    if not isinstance(raw_completion, str):
+        return _unchanged(raw_completion, "unchanged_invalid_input", "completion must be text")
+    parts = _split_completion(raw_completion)
+    if parts is None:
+        return _unchanged(
+            raw_completion, "unchanged_unrecognized_fence", "not a complete Python code fence"
+        )
+    prefix, source, suffix = parts
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError):
+        return _unchanged(raw_completion, "unchanged_parse_error", "Python source did not parse")
+    guard = _candidate(tree)
+    if guard is None or guard.end_lineno is None or guard.col_offset != 0:
+        return _unchanged(
+            raw_completion, "unchanged_no_terminal_guard", "no unique exact terminal main guard"
+        )
+    if _has_dynamic_access(tree):
+        return _unchanged(
+            raw_completion,
+            "unchanged_dynamic_access",
+            "module contains dynamic namespace or reflection access",
+        )
+    if not _module_shape_is_safe(tree, guard):
+        return _unchanged(
+            raw_completion,
+            "unchanged_module_shape",
+            "module has executable setup outside the terminal self-test",
+        )
+    if not any(isinstance(node, ast.Assert) for node in ast.walk(guard)):
+        return _unchanged(raw_completion, "unchanged_no_assert", "main guard has no assertion")
+    if _has_nested_main_guard(guard):
+        return _unchanged(
+            raw_completion, "unchanged_nested_guard", "nested main guard is ambiguous"
+        )
+
+    guard_names = _Names()
+    guard_names.visit(guard)
+    if guard_names.global_or_nonlocal:
+        return _unchanged(
+            raw_completion,
+            "unchanged_scope_mutation",
+            "main block declares global or nonlocal names",
+        )
+    risky = _NoDefinitionsOrImports()
+    risky.visit(guard)
+    if risky.found:
+        return _unchanged(
+            raw_completion,
+            "unchanged_definition_or_import",
+            "main block defines or imports a dependency",
+        )
+    data_names, dict_names = _literal_data_names(guard.body)
+    module_bindings = _module_bindings_except(tree, guard)
+    safe_builtins = _PURE_BUILTINS - module_bindings
+    rebound_functions = _rebound_module_functions(tree, guard)
+    safe_functions = _safe_function_closure(tree, safe_builtins, rebound_functions)
+    if safe_functions != {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }:
+        return _unchanged(
+            raw_completion,
+            "unchanged_uncertain_function",
+            "a module function has unresolved binding or call effects",
+        )
+    if "print" in guard_names.stores or "range" in guard_names.stores:
+        return _unchanged(
+            raw_completion,
+            "unchanged_shadowed_builtin",
+            "main block rebinds a test scaffold builtin",
+        )
+    allowed_guard_names = guard_names.stores | safe_builtins | safe_functions | {"__name__"}
+    if "print" not in module_bindings:
+        allowed_guard_names.add("print")
+    if guard_names.loads - allowed_guard_names:
+        return _unchanged(
+            raw_completion,
+            "unchanged_external_test_input",
+            "main block reads a name outside literal test data or checked functions",
+        )
+    if any(
+        not _test_statement(
+            stmt,
+            safe_builtins,
+            safe_functions,
+            data_names,
+            dict_names,
+            module_bindings,
+            guard_names.stores,
+        )
+        for stmt in guard.body
+    ):
+        return _unchanged(
+            raw_completion,
+            "unchanged_non_test_statement",
+            "main block contains code outside the self-test whitelist",
+        )
+
+    for stmt in tree.body:
+        if stmt is guard:
+            continue
+        external = _Names()
+        external.visit(stmt)
+        if guard_names.stores & external.loads:
+            return _unchanged(
+                raw_completion,
+                "unchanged_external_binding_read",
+                "a name bound by the main block is read outside it",
+            )
+
+    lines = source.splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: guard.lineno - 1])
+    end = sum(len(line) for line in lines[: guard.end_lineno])
+    cleaned_source = source[:start] + source[end:]
+    try:
+        cleaned_tree = ast.parse(cleaned_source)
+    except (SyntaxError, ValueError, TypeError):
+        return _unchanged(
+            raw_completion, "unchanged_post_parse_error", "deletion did not preserve valid Python"
+        )
+
+    expected = copy.deepcopy(tree)
+    expected_guard = _candidate(expected)
+    if expected_guard is None:
+        return _unchanged(
+            raw_completion,
+            "unchanged_ast_mismatch",
+            "could not identify the guard in AST verification",
+        )
+    expected.body.remove(expected_guard)
+    if ast.dump(expected, include_attributes=False) != ast.dump(
+        cleaned_tree, include_attributes=False
+    ):
+        return _unchanged(
+            raw_completion, "unchanged_ast_mismatch", "non-guard AST changed during source slicing"
+        )
+
+    cleaned = prefix + cleaned_source + suffix
+    return {
+        "completion": cleaned,
+        "changed": True,
+        "status": "cleaned_terminal_selftest",
+        "reason": "removed one terminal exact main guard containing assertions; non-guard AST verified identical",
+        "removed_spans": [
+            {
+                "start_line": guard.lineno + (1 if prefix else 0),
+                "end_line": guard.end_lineno + (1 if prefix else 0),
+            }
+        ],
+    }
+
+
+def _select_plan_with_quote_grounding(parsed: Any, prompt: str) -> tuple[Any, dict[str, Any]]:
+    normalized = copy.deepcopy(parsed)
+    receipts: list[dict[str, Any]] = []
+    changed = False
+    candidates = normalized.get("candidates") if isinstance(normalized, dict) else None
+    if isinstance(candidates, list):
+        for candidate_index, candidate in enumerate(candidates[:2]):
+            if not isinstance(candidate, dict):
+                continue
+            quotes = candidate.get("source_quotes")
+            if not isinstance(quotes, list):
+                continue
+            rewritten: list[Any] = list(quotes)
+            for quote_index, quote in enumerate(quotes):
+                grounded, receipt = ground_quote(prompt, quote)
+                receipt["candidate_index"] = candidate_index
+                receipt["quote_index"] = quote_index
+                receipts.append(receipt)
+                if receipt["status"] == "normalized_whitespace" and grounded is not None:
+                    rewritten[quote_index] = grounded
+                    changed = True
+            if changed and rewritten != quotes:
+                candidate["source_quotes"] = rewritten
+    return normalized, {"changed": changed, "quotes": receipts}
+
+
+class _PlanProxy:
+    """Forward SDK operations and normalize only a parsed native Plan response."""
+
+    def __init__(self, env: Any, problem: dict[str, Any]):
+        self.environment = env
+        self.problem = problem
+        self.quote_receipt: dict[str, Any] = {"changed": False, "quotes": []}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.environment, name)
+
+    def llm(self, *args: Any, **kwargs: Any) -> Any:
+        response = self.environment.llm(*args, **kwargs)
+        messages = args[0] if args else kwargs.get("messages")
+        is_plan = (
+            isinstance(messages, list)
+            and bool(messages)
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "system"
+            and messages[0].get("content") == _PLAN_SYSTEM
+        )
+        if not is_plan:
+            return response
+        parsed = _parse_plan(response)
+        if parsed is None:
+            return response
+        prompt = _as_prompt(self.problem)
+        if not isinstance(prompt, str):
+            return response
+        normalized, receipt = _select_plan_with_quote_grounding(parsed, prompt)
+        self.quote_receipt = receipt
+        if not receipt["changed"]:
+            return response
+        return json.dumps(normalized, ensure_ascii=False)
+
+
+class DecisionClarifier(_R0DecisionClarifier):
+    """R0 Plan/QA/Solve path with V1 quote normalization and cleanup."""
+
+    DEFAULT_CONFIG = _R0DecisionClarifier.DEFAULT_CONFIG
+
+    def run(self, env: Any, problem: dict[str, Any]) -> str:
+        proxy = _PlanProxy(env, problem)
+        raw_completion = super().run(proxy, problem)
+        self.quote_grounding_receipt = proxy.quote_receipt
+        self.quote_only_completion = raw_completion
+        self.cleanup_receipt = clean_completion(raw_completion)
+        return self.cleanup_receipt["completion"]
